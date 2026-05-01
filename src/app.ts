@@ -1,0 +1,241 @@
+import { Hono } from 'hono';
+import type { Env } from './env';
+import { clearSessionCookie, getSession, retryD1, sessionCookie } from './db';
+import { rankActionItems } from './classifier';
+import type { GitHubActionItem } from './types';
+import { processGithubChange, runDiscovery } from './scanner';
+
+type Bindings = Env;
+const app = new Hono<{ Bindings: Bindings }>();
+
+app.get('/', async (c) => {
+  const session = await getSession(c.env.DB, c.req.header('Cookie') ?? null);
+  if (session) return c.redirect('/dashboard');
+  const missing = setupMissing(c.env);
+  if (c.req.query('json') !== undefined) return c.json({ product: 'Sunrise', signedIn: false, setup: { missing } });
+  return html(`
+    <section class="hero panel">
+    <p class="actions"><a class="button primary" href="${c.env.GITHUB_REPO_URL ?? 'https://github.com/adewale/sunrise'}">Deploy your own</a> <a class="button ghost" href="/login">Sign in with GitHub</a></p>
+    <p class="muted">Single-user, read-only by default, and your snapshots stay in your Cloudflare account.</p></section>
+    ${renderSetupGuide(missing, c.req.url)}
+  `);
+});
+
+app.get('/design', (c) => {
+  return html(renderDesignLanguage());
+});
+
+app.get('/login', async (c) => {
+  const missing = setupMissing(c.env).filter((m) => m !== 'GITHUB_CLIENT_SECRET');
+  if (missing.length) return c.text(`Missing setup: ${missing.join(', ')}`, 500);
+  const state = crypto.randomUUID();
+  const verifier = crypto.randomUUID();
+  const now = new Date();
+  const expires = new Date(now.getTime() + 10 * 60 * 1000).toISOString();
+  await retryD1(() => c.env.DB.prepare('INSERT INTO oauth_states (state, code_verifier, expires_at, created_at) VALUES (?, ?, ?, ?)').bind(state, verifier, expires, now.toISOString()).run());
+  const callback = new URL(c.req.url); callback.pathname = '/callback'; callback.search = '';
+  const url = new URL('https://github.com/login/oauth/authorize');
+  url.searchParams.set('client_id', c.env.GITHUB_CLIENT_ID!);
+  url.searchParams.set('redirect_uri', callback.toString());
+  url.searchParams.set('state', state);
+  url.searchParams.set('scope', 'read:user user:email notifications repo');
+  return c.redirect(url.toString());
+});
+
+app.get('/callback', async (c) => {
+  const state = c.req.query('state');
+  const code = c.req.query('code');
+  if (!state || !code) return c.text('Missing OAuth callback parameters', 400);
+  const row = await c.env.DB.prepare('SELECT * FROM oauth_states WHERE state = ? AND expires_at > ?').bind(state, new Date().toISOString()).first<Record<string, string>>();
+  await c.env.DB.prepare('DELETE FROM oauth_states WHERE state = ?').bind(state).run();
+  if (!row) return c.text('Invalid or expired OAuth state', 400);
+  const callback = new URL(c.req.url); callback.pathname = '/callback'; callback.search = '';
+  const tokenRes = await fetch('https://github.com/login/oauth/access_token', { method: 'POST', headers: { Accept: 'application/json' }, body: new URLSearchParams({ client_id: c.env.GITHUB_CLIENT_ID!, client_secret: c.env.GITHUB_CLIENT_SECRET!, code, redirect_uri: callback.toString(), state }) });
+  const tokenJson = await tokenRes.json<any>();
+  if (!tokenJson.access_token) return c.text('OAuth token exchange failed', 401);
+  const userRes = await fetch('https://api.github.com/user', { headers: { Authorization: `Bearer ${tokenJson.access_token}`, Accept: 'application/vnd.github+json', 'User-Agent': 'sunrise-dashboard' } });
+  const user = await userRes.json<any>();
+  if ((c.env.OWNER_LOGIN && user.login !== c.env.OWNER_LOGIN) || (c.env.OWNER_ID && String(user.id) !== String(c.env.OWNER_ID))) return html('<h1>Not owner</h1><p>This is a personal Sunrise instance. Deploy your own version from the GitHub repo.</p>', 403);
+  const sid = crypto.randomUUID();
+  await c.env.DB.prepare('INSERT INTO sessions (id, github_login, github_id, access_token, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?)')
+    .bind(sid, user.login, String(user.id), tokenJson.access_token, new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(), new Date().toISOString()).run();
+  c.header('Set-Cookie', sessionCookie(sid));
+  return c.redirect('/dashboard');
+});
+
+app.get('/dashboard', async (c) => {
+  const session = await requireSession(c);
+  if (session instanceof Response) return session;
+  const props = await dashboardProps(c.env, session.githubLogin);
+  if (c.req.query('json') !== undefined || c.req.header('Accept')?.includes('application/json')) return c.json(props);
+  return html(renderDashboard(props));
+});
+
+app.post('/refresh', async (c) => {
+  const session = await requireSession(c);
+  if (session instanceof Response) return session;
+  await runDiscovery(c.env, 'manual', session.accessToken);
+  return c.redirect('/dashboard');
+});
+
+app.get('/runs', async (c) => {
+  const session = await requireSession(c);
+  if (session instanceof Response) return session;
+  const runs = (await c.env.DB.prepare('SELECT * FROM scan_runs ORDER BY started_at DESC LIMIT 10').all()).results;
+  if (c.req.header('Accept')?.includes('application/json')) return c.json({ runs });
+  return html(`<section class="section panel"><p class="eyebrow">Operations</p><h1>Runs</h1><table><thead><tr><th>Started</th><th>Trigger</th><th>Status</th><th>Candidates</th><th>Processed</th><th>Error</th></tr></thead><tbody>${runs.map((r: any) => `<tr><td>${r.started_at}</td><td>${r.trigger}</td><td><span class="badge">${r.status}</span></td><td>${r.candidate_count}</td><td>${r.processed_count ?? 0}</td><td>${escapeHtml(r.error ?? '')}</td></tr>`).join('')}</tbody></table></section>`);
+});
+
+app.post('/logout', async (c) => {
+  const cookie = c.req.header('Cookie') ?? '';
+  const sid = /(?:^|;\s*)sunrise_session=([^;]+)/.exec(cookie)?.[1];
+  if (sid) await c.env.DB.prepare('DELETE FROM sessions WHERE id = ?').bind(sid).run();
+  c.header('Set-Cookie', clearSessionCookie());
+  return c.redirect('/');
+});
+
+app.post('/ignore', async (c) => {
+  const session = await requireSession(c);
+  if (session instanceof Response) return session;
+  const form = await c.req.parseBody();
+  const key = String(form.canonicalSubjectKey ?? '');
+  if (key) await c.env.DB.prepare('INSERT OR IGNORE INTO ignored_items (canonical_subject_key, reason, ignored_at) VALUES (?, ?, ?)').bind(key, 'manual ignore', new Date().toISOString()).run();
+  return c.redirect('/dashboard');
+});
+
+app.post('/__debug/run-daily-scan', async (c) => {
+  if (c.env.TEST_GITHUB_FIXTURES !== 'true') return c.text('Not enabled', 403);
+  return c.json(await runDiscovery(c.env, 'manual'));
+});
+
+app.post('/__debug/reprocess/:changeId', async (c) => {
+  if (c.env.TEST_GITHUB_FIXTURES !== 'true') return c.text('Not enabled', 403);
+  await processGithubChange(c.env, { kind: 'process-github-change', runId: 'debug', changeId: c.req.param('changeId') });
+  return c.json({ ok: true });
+});
+
+async function dashboardProps(env: Env, login: string) {
+  const rows = await env.DB.prepare('SELECT * FROM action_items WHERE ignored_at IS NULL ORDER BY priority ASC, updated_at DESC LIMIT 50').all<Record<string, any>>();
+  const items = rankActionItems(rows.results.map(rowToItem)).slice(0, 20);
+  const lastRun = await env.DB.prepare('SELECT * FROM scan_runs ORDER BY started_at DESC LIMIT 1').first<Record<string, any>>();
+  const rate = await env.DB.prepare('SELECT * FROM rate_limit_snapshots ORDER BY captured_at DESC LIMIT 1').first<Record<string, any>>();
+  return {
+    product: 'Sunrise',
+    signedInAs: login,
+    freshness: { lastScanAt: lastRun?.completed_at ?? lastRun?.started_at ?? null, status: scanStatus(lastRun) },
+    rateLimit: rate ? { remaining: rate.remaining, resetAt: rate.reset_at } : null,
+    counts: {
+      assigned: items.filter((i) => i.kind === 'assigned').length,
+      mentioned: items.filter((i) => i.kind === 'mention').length,
+      createdIssuesNeedingResponse: items.filter((i) => i.kind === 'maintenance').length,
+      authoredOpenPrs: items.filter((i) => i.kind.startsWith('authored_pr') || i.kind === 'stale_green_pr').length,
+      reviewRequests: items.filter((i) => i.kind === 'review_requested').length,
+    },
+    sections: {
+      P0: { title: 'Waiting on me / broken authored work', collapsed: false },
+      P1: { title: 'Direct conversations', collapsed: false },
+      P2: { title: 'Loop-closure debt', collapsed: items.filter((i) => i.priority === 'P2').length > 5 },
+      P3: { title: 'FYI', collapsed: true },
+    },
+    items,
+    news: items.filter((i) => ['review_requested', 'mention', 'assigned', 'authored_pr_failing'].includes(i.kind)).slice(0, 10),
+  };
+}
+
+function rowToItem(row: Record<string, any>): GitHubActionItem {
+  return { id: row.id, canonicalSubjectKey: row.canonical_subject_key, priority: row.priority, kind: row.kind, title: row.title, repo: row.repo, url: row.url, updatedAt: row.updated_at, reason: row.reason, suggestedAction: row.suggested_action, evidence: JSON.parse(row.evidence_json || '{}'), source: row.source };
+}
+
+async function requireSession(c: any) {
+  const session = await getSession(c.env.DB, c.req.header('Cookie') ?? null);
+  return session ?? c.redirect('/login');
+}
+
+function setupMissing(env: Env) {
+  return ['DB', 'GITHUB_CLIENT_ID', 'GITHUB_CLIENT_SECRET', 'OWNER_LOGIN', 'SESSION_SECRET'].filter((key) => !(env as any)[key]);
+}
+
+function scanStatus(run: Record<string, any> | null) {
+  if (!run) return 'stale';
+  if (run.status === 'failed' || run.status === 'running') return run.status;
+  return Date.now() - Date.parse(run.completed_at ?? run.started_at) > 36 * 60 * 60 * 1000 ? 'stale' : 'fresh';
+}
+
+function renderDashboard(props: any) {
+  return `<header class="masthead panel"><div><p class="eyebrow">${escapeHtml(props.signedInAs)} · ${props.freshness.status}</p><h1>Dashboard</h1><p class="muted">Last scan ${props.freshness.lastScanAt ?? 'never'}${props.rateLimit ? ` · rate limit ${props.rateLimit.remaining}` : ''}</p></div><form method="post" action="/refresh"><button class="button primary">Manual refresh</button></form></header>
+  <section class="metrics">${renderMetric('Assigned', props.counts.assigned)}${renderMetric('Mentioned', props.counts.mentioned)}${renderMetric('Authored PRs', props.counts.authoredOpenPrs)}${renderMetric('Reviews', props.counts.reviewRequests)}</section>
+  ${(['P0','P1','P2','P3'] as const).map((p) => `<section class="section panel priority-${p.toLowerCase()}"><div class="section-head"><div><p class="eyebrow">${p}</p><h2>${props.sections[p].title}</h2></div>${props.sections[p].collapsed ? '<span class="badge">collapsed</span>' : ''}</div><div class="item-list">${props.items.filter((i: GitHubActionItem) => i.priority === p).map(renderItem).join('') || '<p class="empty">Nothing here right now.</p>'}</div></section>`).join('')}
+  <section class="section panel"><div class="section-head"><div><p class="eyebrow">Recent signal</p><h2>News for me</h2></div></div>${props.news.map(renderItem).join('') || '<p class="empty">No recent actionable updates.</p>'}</section>`;
+}
+
+function renderMetric(label: string, value: number) {
+  return `<div class="metric panel"><span>${escapeHtml(label)}</span><strong>${value}</strong></div>`;
+}
+
+function renderDesignLanguage() {
+  const sampleItem: GitHubActionItem = {
+    id: 'design-sample',
+    canonicalSubjectKey: 'design:sample',
+    priority: 'P0',
+    kind: 'authored_pr_unverified',
+    title: 'Authored PR is green but missing verification evidence',
+    repo: 'owner/repo',
+    url: '#',
+    updatedAt: new Date().toISOString(),
+    reason: 'The item row, chips, title, reason, and action copy reuse the dashboard renderer.',
+    suggestedAction: 'Add verification summary or run the declared verify command',
+    evidence: { checks: 'success', hasVerificationSummary: false },
+    source: 'pulls',
+  };
+  return `<header class="masthead panel"><div><p class="eyebrow">Design language</p><h1>Interface kit</h1><p class="muted">This page is public and reuses the same components as the product UI, so changes to originals update here too.</p></div><a class="button ghost" href="/">Back home</a></header>
+  <section class="metrics">${renderMetric('Assigned', 3)}${renderMetric('Mentioned', 7)}${renderMetric('Authored PRs', 12)}${renderMetric('Reviews', 2)}</section>
+  <section class="section panel"><div class="section-head"><div><p class="eyebrow">Type</p><h2>Warm, crisp, operational</h2></div><span class="badge">public</span></div><p class="muted">Fraunces gives Sunrise its personality. IBM Plex Sans keeps dense dashboard text readable. IBM Plex Mono marks system labels, chips, code, and table headers.</p><p class="actions"><a class="button primary" href="#">Primary action</a><button class="button ghost">Secondary action</button><button class="button quiet">Quiet action</button></p></section>
+  <section class="section panel priority-p0"><div class="section-head"><div><p class="eyebrow">Action item</p><h2>Dashboard row</h2></div><span class="badge">P0</span></div><div class="item-list">${renderItem(sampleItem)}</div></section>
+  <section class="section panel"><div class="section-head"><div><p class="eyebrow">Setup pattern</p><h2>First-boot cards</h2></div></div><div class="deploy-card"><div><strong>Start with one-click deploy</strong><p>Cards, copy, buttons, and code styling mirror onboarding.</p></div><a class="button primary" href="#">Deploy to Cloudflare</a></div><div class="config-card"><p><span>Homepage URL</span><code>https://sunrise.example.workers.dev</code></p><p><span>Callback URL</span><code>https://sunrise.example.workers.dev/callback</code></p></div></section>
+  <section class="section panel"><div class="section-head"><div><p class="eyebrow">Table</p><h2>Runs table</h2></div></div><table><thead><tr><th>Started</th><th>Trigger</th><th>Status</th><th>Candidates</th></tr></thead><tbody><tr><td>2026-05-01</td><td>manual</td><td><span class="badge">succeeded</span></td><td>18</td></tr></tbody></table></section>`;
+}
+
+function renderItem(item: GitHubActionItem) {
+  const chips = [item.priority, item.kind.replaceAll('_', ' '), item.repo].map((chip) => `<span class="chip">${escapeHtml(chip)}</span>`).join('');
+  return `<article class="item"><div class="item-main"><div class="chips">${chips}</div><a class="item-title" href="${item.url}">${escapeHtml(item.title)}</a><p>${escapeHtml(item.reason)}</p><p class="action">${escapeHtml(item.suggestedAction)}</p></div><form method="post" action="/ignore"><input type="hidden" name="canonicalSubjectKey" value="${escapeHtml(item.canonicalSubjectKey)}"><button class="button quiet">Ignore</button></form></article>`;
+}
+
+function renderSetupGuide(missing: string[], requestUrl: string) {
+  const origin = new URL(requestUrl).origin;
+  const callbackUrl = `${origin}/callback`;
+  const deployUrl = 'https://deploy.workers.cloudflare.com/?url=https://github.com/adewale/sunrise&paid=true';
+  const dashboardPath = 'Workers & Pages → sunrise → Settings → Variables and Secrets';
+  const steps = [
+    ['Deploy your own copy', 'Use the Deploy to Cloudflare button. Cloudflare forks the repo, provisions D1 and Queues from wrangler.jsonc, runs the build, and enables deploys from your fork.'],
+    ['Create a GitHub OAuth app', `Use Homepage URL ${origin} and Authorization callback URL ${callbackUrl}.`],
+    ['Add secrets in Cloudflare', `Open ${dashboardPath}. Set GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET, OWNER_LOGIN, optional OWNER_ID, and SESSION_SECRET.`],
+    ['Reload this page', 'The checklist reads this instance configuration. When required secrets are present, Sign in with GitHub becomes the happy path.'],
+    ['Sign in and refresh', 'Sign in as the configured owner, then use Manual refresh to populate the first dashboard snapshot.'],
+  ];
+  const status = missing.length ? `<p class="setup-status">Needs ${missing.length} value${missing.length === 1 ? '' : 's'}: ${missing.map((m) => `<code>${escapeHtml(m)}</code>`).join(' ')}</p>` : '<p class="setup-status ready">Configuration looks ready. Sign in to scan GitHub.</p>';
+  return `<section class="panel setup"><div class="section-head"><div><p class="eyebrow">First boot</p><h2>Setup checklist</h2></div><span class="badge">${missing.length ? 'action needed' : 'ready'}</span></div>${status}<div class="deploy-card"><div><strong>Start with one-click deploy</strong><p>Best for most users: no local CLI required for the first deployment.</p></div><a class="button primary" href="${deployUrl}">Deploy to Cloudflare</a></div><div class="config-card"><p><span>Homepage URL</span><code>${escapeHtml(origin)}</code></p><p><span>Callback URL</span><code>${escapeHtml(callbackUrl)}</code></p></div><ol class="setup-steps">${steps.map(([title, copy], index) => `<li><span class="step-number">${index + 1}</span><div><strong>${escapeHtml(title)}</strong><p>${escapeHtml(copy)}</p></div></li>`).join('')}</ol><p class="muted">Sunrise should never ask users to send tokens to a hosted service. OAuth secrets and GitHub data stay in the deployer’s Cloudflare account.</p></section>`;
+}
+
+function html(body: string, status = 200) {
+  return new Response(`<!doctype html><html><head><title>Sunrise</title><meta name="viewport" content="width=device-width, initial-scale=1"><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght,SOFT,WONK@9..144,600..900,60,1&family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@500;600&display=swap" rel="stylesheet"><script>${themeScript()}</script><style>${designCss()}</style></head><body><a class="skip-link" href="#content">Skip to content</a><header class="site-header"><a class="brand" href="/">Sunrise</a></header><button class="theme-toggle" type="button" aria-label="Toggle dark mode" aria-pressed="false" title="Toggle dark mode"><span class="sun-icon" aria-hidden="true"></span><span class="moon-icon" aria-hidden="true"></span></button><main id="content">${body}</main></body></html>`, { status, headers: { 'content-type': 'text/html; charset=utf-8' } });
+}
+
+function themeScript() {
+  return `(function(){var key='sunrise-theme';var saved=localStorage.getItem(key);var theme=saved||((matchMedia&&matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light');function apply(t,animate){var root=document.documentElement;if(animate){root.classList.add('theme-changing',t==='dark'?'theme-to-dark':'theme-to-light');clearTimeout(window.__sunriseThemeTimer);window.__sunriseThemeTimer=setTimeout(function(){root.classList.remove('theme-changing','theme-to-dark','theme-to-light');},620);}root.dataset.theme=t;var b=document.querySelector('.theme-toggle');if(b)b.setAttribute('aria-pressed',String(t==='dark'));}document.documentElement.dataset.theme=theme;addEventListener('DOMContentLoaded',function(){apply(theme,false);var b=document.querySelector('.theme-toggle');if(!b)return;b.addEventListener('click',function(){var next=document.documentElement.dataset.theme==='dark'?'light':'dark';apply(next,true);localStorage.setItem(key,next);});});})();`;
+}
+
+function designCss() {
+  return `:root{color-scheme:light;--bg:#f8f1df;--bg-wash:radial-gradient(circle at 20% -10%,rgba(255,178,63,.35),transparent 34rem),radial-gradient(circle at 90% 10%,rgba(223,111,89,.16),transparent 30rem),linear-gradient(180deg,#fbf4e5,#f7edd9 58%,#f4e7cf);--surface:#fffaf0;--surface-2:#fffbf3;--surface-3:#f5e6c9;--ink:#24180d;--muted:#7b6d5f;--accent:#ffb23f;--accent-ink:#24180d;--line:rgba(85,55,21,.22);--line-strong:rgba(85,55,21,.30);--focus:rgba(255,178,63,.85);--shadow:0 1px 0 rgba(255,255,255,.65) inset,0 1px 2px rgba(61,37,13,.08),0 10px 24px rgba(61,37,13,.10);--button-shadow:0 1px 0 rgba(255,255,255,.55) inset,0 1px 2px rgba(61,37,13,.08);--radius:12px;--inner:8px;--gap:16px;--font-body:"IBM Plex Sans",ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;--font-display:"Fraunces",Georgia,serif;--font-mono:"IBM Plex Mono",ui-monospace,monospace}html[data-theme=dark]{color-scheme:dark;--bg:#0c1118;--bg-wash:radial-gradient(circle at 18% -10%,rgba(83,109,151,.20),transparent 34rem),radial-gradient(circle at 92% 8%,rgba(92,72,126,.16),transparent 30rem),linear-gradient(180deg,#0f1620,#0b1017 58%,#080c12);--surface:#162130;--surface-2:#172230;--surface-3:#223144;--ink:#f3efe7;--muted:#9da8b4;--accent:#adc4e6;--accent-ink:#06101c;--line:rgba(222,232,245,.18);--line-strong:rgba(222,232,245,.30);--focus:rgba(159,182,216,.82);--shadow:0 1px 0 rgba(255,255,255,.07) inset,0 1px 2px rgba(0,0,0,.50),0 18px 38px rgba(0,0,0,.42);--button-shadow:0 1px 0 rgba(255,255,255,.10) inset,0 -1px 0 rgba(0,0,0,.35) inset,0 2px 3px rgba(0,0,0,.35),0 10px 18px rgba(0,0,0,.20)}*{box-sizing:border-box}html{min-height:100%;background:var(--bg)}body{min-height:100%;margin:0;color:var(--ink);font-family:var(--font-body);-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility;background:var(--bg-wash);transition:background-color .42s cubic-bezier(.2,0,0,1),color .42s cubic-bezier(.2,0,0,1)}body:before{content:"";position:fixed;inset:0;pointer-events:none;opacity:.22;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140' viewBox='0 0 140 140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.8' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='140' height='140' filter='url(%23n)' opacity='.22'/%3E%3C/svg%3E");mix-blend-mode:multiply}html[data-theme=dark] body:before{opacity:.13;mix-blend-mode:screen}body:after{content:"";position:fixed;inset:0;z-index:10;pointer-events:none;background:#0b1017;opacity:0;transition:none}html.theme-to-dark body:after{animation:theme-dim .62s cubic-bezier(.2,0,0,1)}html.theme-to-light body:after{background:#f8f1df;animation:theme-lift .52s cubic-bezier(.2,0,0,1)}@keyframes theme-dim{0%{opacity:0}35%{opacity:.16}100%{opacity:0}}@keyframes theme-lift{0%{opacity:0}35%{opacity:.055}100%{opacity:0}}
+.site-header{position:fixed;z-index:19;top:20px;left:28px;right:112px;display:flex;align-items:center;min-height:62px;min-width:0}.brand{display:block;max-width:100%;padding:.08em 0 .12em;overflow:visible;white-space:nowrap;font-family:var(--font-display);font-size:34px;font-weight:850;font-variation-settings:"SOFT" 60,"WONK" 1;letter-spacing:-.06em;line-height:1.12;color:var(--ink);text-decoration:none;text-shadow:0 1px 0 rgba(255,255,255,.28);transition:color .42s cubic-bezier(.2,0,0,1),transform .18s ease}.brand:hover{transform:translateY(-1px)}html[data-theme=dark] .brand{text-shadow:0 1px 0 rgba(255,255,255,.06)}main{width:min(1120px,calc(100% - 32px));margin:108px auto 72px;display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:var(--gap);align-items:start}main>*{grid-column:1/-1;min-width:0}.panel{position:relative;min-width:0;border:1px solid var(--line);border-radius:var(--radius);background:var(--surface);box-shadow:var(--shadow);transition:background .42s cubic-bezier(.2,0,0,1),border-color .42s cubic-bezier(.2,0,0,1),box-shadow .42s cubic-bezier(.2,0,0,1)}.panel>*{position:relative;z-index:1}.panel:after{content:"";position:absolute;inset:0;border-radius:calc(var(--radius) - 1px);pointer-events:none;border-top:1px solid rgba(255,255,255,.42)}html[data-theme=dark] .panel:after{border-top-color:rgba(255,255,255,.095)}.hero{padding:72px;overflow:hidden}.section,.setup,.masthead{padding:24px}.masthead{display:flex;justify-content:space-between;gap:12px;align-items:center;flex-wrap:wrap;min-width:0}.masthead h1{font-size:52px;margin:0 0 8px}.section-head{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:16px;align-items:start;margin-bottom:18px}
+.skip-link{position:fixed;left:16px;top:12px;z-index:30;transform:translateY(-160%);background:var(--ink);color:var(--surface);padding:10px 12px;border-radius:8px}.skip-link:focus{transform:none}.theme-toggle{position:fixed;z-index:20;right:28px;top:28px;width:62px;height:62px;padding:0;border:1px solid var(--line-strong);border-radius:999px;background:var(--surface-3);box-shadow:var(--button-shadow);cursor:pointer;transition:transform .22s cubic-bezier(.2,0,0,1),background .22s ease,box-shadow .22s ease}.theme-toggle:hover{transform:translateY(-1px) rotate(8deg)}.theme-toggle:active{transform:scale(.96)}.sun-icon,.moon-icon{position:absolute;inset:12px;border-radius:999px;transition:opacity .24s cubic-bezier(.2,0,0,1),transform .24s cubic-bezier(.2,0,0,1),filter .24s cubic-bezier(.2,0,0,1)}.sun-icon{background:radial-gradient(circle,#ffd89a,#ffb23f);box-shadow:0 0 28px rgba(255,178,63,.44);opacity:1;transform:scale(1);filter:blur(0)}.moon-icon{inset:16px 20px 16px 8px;border-radius:999px;background:transparent;box-shadow:14px 0 0 0 #dbe8fb,17px 0 18px rgba(151,185,255,.22);opacity:0;transform:scale(.25) rotate(-10deg);filter:blur(4px)}.moon-icon:after{content:"";position:absolute;left:25px;top:7px;width:3px;height:3px;border-radius:999px;background:rgba(92,114,142,.34);box-shadow:5px 9px 0 1px rgba(92,114,142,.22),-2px 18px 0 0 rgba(92,114,142,.18);pointer-events:none}html[data-theme=dark] .sun-icon{opacity:0;transform:scale(.25);filter:blur(4px)}html[data-theme=dark] .moon-icon{opacity:1;transform:scale(1) rotate(-18deg);filter:blur(0)}
+h1,h2,p{margin-block-start:0}h1,h2{text-wrap:balance;font-family:var(--font-display);font-variation-settings:"SOFT" 60,"WONK" 1}h1{font-size:clamp(58px,10vw,128px);font-weight:850;letter-spacing:-.07em;line-height:.82;margin-bottom:24px}h2{font-size:28px;font-weight:760;letter-spacing:-.04em;line-height:.95;margin-bottom:0}.muted,.empty{color:var(--muted);line-height:1.55;text-wrap:pretty}.eyebrow{font-family:var(--font-mono);font-size:11px;font-weight:600;letter-spacing:.14em;text-transform:uppercase;color:color-mix(in srgb,var(--accent) 72%,var(--ink));margin-bottom:14px}.actions{display:flex;gap:12px;align-items:center;flex-wrap:wrap;min-width:0}.button{min-height:40px;display:inline-flex;align-items:center;justify-content:center;border:1px solid var(--line-strong);border-radius:8px;padding:0 16px;font:inherit;font-weight:700;letter-spacing:-.01em;text-decoration:none;color:var(--ink);background:var(--surface-2);box-shadow:var(--button-shadow);transition:transform .16s ease,box-shadow .16s ease,background .16s ease,border-color .16s ease}.button:hover{transform:translateY(-1px);border-color:var(--line-strong)}.button:active{transform:scale(.96)}.primary{background:var(--accent);color:var(--accent-ink);border-color:color-mix(in srgb,var(--accent) 55%,var(--line-strong))}.ghost,.quiet{background:var(--surface-2)}.quiet{color:var(--muted)}:focus-visible{outline:3px solid var(--focus);outline-offset:3px}
+.metrics{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:12px;margin:0}.metric{grid-column:span 3;min-width:0;padding:18px;border-radius:10px}.metric span{display:block;color:var(--muted);font-size:13px;font-weight:600}.metric strong{font-family:var(--font-display);font-variant-numeric:tabular-nums;font-size:38px;font-weight:780;letter-spacing:-.055em}.item-list{display:grid;gap:10px}.item,.deploy-card,.setup-steps li{background:var(--surface-2);border:1px solid var(--line);border-radius:var(--inner);box-shadow:0 1px 0 rgba(255,255,255,.22) inset,0 1px 2px rgba(0,0,0,.06)}.item{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:18px;align-items:center;padding:16px;transition:background-color .42s cubic-bezier(.2,0,0,1),border-color .42s cubic-bezier(.2,0,0,1),box-shadow .42s cubic-bezier(.2,0,0,1)}.item-main{min-width:0}.item-title{display:block;margin:8px 0 6px;color:var(--ink);font-size:19px;font-weight:700;letter-spacing:-.025em;line-height:1.12;text-decoration:none}.item-title:hover{text-decoration:underline;text-decoration-thickness:2px;text-underline-offset:3px}.item p{margin-bottom:6px;color:var(--muted);line-height:1.35}.item .action{color:var(--ink);font-weight:700}.chips{display:flex;gap:6px;flex-wrap:wrap}.chip,.badge{display:inline-flex;align-items:center;min-height:24px;padding:0 9px;border-radius:6px;background:var(--surface-3);border:1px solid var(--line);color:color-mix(in srgb,var(--accent) 45%,var(--ink));font-family:var(--font-mono);font-size:11px;font-weight:600;letter-spacing:-.02em}.priority-p0{border-color:color-mix(in srgb,#df6f59 44%,var(--line))}.priority-p1{border-color:color-mix(in srgb,var(--accent) 48%,var(--line))}.priority-p2{border-color:color-mix(in srgb,#5f8f6a 36%,var(--line))}
+.setup-status,.config-card{border:1px solid var(--line);border-radius:var(--inner);background:var(--surface-2);padding:12px;color:var(--ink)}.setup-status.ready{color:#315d38}html[data-theme=dark] .setup-status.ready{color:#add6b5}.deploy-card,.config-card{display:grid;grid-template-columns:minmax(0,1fr) auto;justify-content:space-between;gap:16px;align-items:center;margin-top:12px;padding:14px}.deploy-card p{margin:4px 0 0;color:var(--muted)}.config-card{grid-template-columns:1fr;align-items:stretch}.config-card p{display:grid;grid-template-columns:minmax(140px,auto) minmax(0,1fr);gap:12px;margin:0;color:var(--muted)}.config-card code{display:block;min-width:0;overflow:auto;white-space:nowrap}.setup-steps{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;padding:0;margin:16px 0 0;list-style:none}.setup-steps li{display:grid;grid-template-columns:28px minmax(0,1fr);gap:12px;padding:14px}.setup-steps p{margin:4px 0 0;color:var(--muted);text-wrap:pretty}.step-number{height:28px;display:grid;place-items:center;border-radius:7px;background:var(--accent);color:var(--accent-ink);font-family:var(--font-mono);font-weight:600;font-variant-numeric:tabular-nums}code{font-family:var(--font-mono);font-size:.92em;padding:2px 5px;border:1px solid var(--line);border-radius:5px;background:color-mix(in srgb,var(--surface-2) 70%,white)}html[data-theme=dark] code{background:rgba(255,255,255,.075)}table{width:100%;min-width:640px;border-collapse:separate;border-spacing:0 8px}th{text-align:left;color:var(--muted);font-family:var(--font-mono);font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.08em}td,th{padding:10px 12px}td{background:var(--surface-2);border-block:1px solid var(--line)}td:first-child{border-left:1px solid var(--line);border-radius:8px 0 0 8px}td:last-child{border-right:1px solid var(--line);border-radius:0 8px 8px 0}
+@media(prefers-reduced-motion:reduce){*,*:before,*:after{transition:none!important;animation:none!important;scroll-behavior:auto!important}}@media(max-width:900px){.metric{grid-column:span 6}.setup-steps{grid-template-columns:1fr}}@media(max-width:760px){main{width:min(100% - 20px,1120px);margin-top:88px;grid-template-columns:repeat(6,minmax(0,1fr));gap:12px}.site-header{top:12px;left:16px;right:84px;min-height:52px}.brand{font-size:30px}.theme-toggle{right:16px;top:16px;width:52px;height:52px}.hero{padding:36px 24px}.metric{grid-column:span 3}.item,.masthead,.deploy-card{grid-template-columns:1fr;align-items:stretch}.section-head,.config-card p{grid-template-columns:1fr}.config-card p{gap:4px}table{min-width:560px}h1{font-size:64px}}@media(max-width:440px){.metric{grid-column:1/-1}.actions .button{width:100%}.hero,.section,.setup,.masthead{padding:20px}.item{padding:14px}h1{font-size:54px}}`;
+}
+
+function escapeHtml(value: string) {
+  return value.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]!));
+}
+
+export default app;

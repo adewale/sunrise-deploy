@@ -1,0 +1,60 @@
+import { describe, expect, it } from 'vitest';
+import app from '../src/app';
+import type { Env } from '../src/env';
+import { createMemoryDb } from './memory-db';
+
+describe('Sunrise app routes', () => {
+  it('renders public landing with deploy CTA and setup checklist when signed out', async () => {
+    const env = { DB: createMemoryDb(), GITHUB_CLIENT_ID: '', OWNER_LOGIN: 'ade', SESSION_SECRET: 'x' } as unknown as Env;
+    const res = await app.request('/', {}, env);
+    const html = await res.text();
+    expect(html).toContain('Sunrise');
+    expect(html).toContain('Deploy your own');
+    expect(html).toContain('Setup checklist');
+  });
+
+  it('returns dashboard JSON from the same props shape with <=20 default items and P3 collapsed', async () => {
+    const db = createMemoryDb();
+    await db.prepare("INSERT INTO sessions (id, github_login, github_id, access_token, expires_at, created_at) VALUES ('sid','ade','1','tok','2999-01-01T00:00:00Z','2026-01-01T00:00:00Z')").run();
+    for (let i = 0; i < 25; i++) {
+      await db.prepare('INSERT INTO action_items (id, canonical_subject_key, priority, kind, title, repo, url, updated_at, reason, suggested_action, evidence_json, source, ignored_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)')
+        .bind(`i${i}`, `k${i}`, i < 2 ? 'P0' : 'P3', 'notification', `Item ${i}`, 'o/r', 'https://github.com/o/r/issues/1', '2026-04-30T00:00:00Z', 'Reason', 'Do it', '{}', 'notifications').run();
+    }
+    const res = await app.request('/dashboard?json', { headers: { Cookie: 'sunrise_session=sid' } }, { DB: db, OWNER_LOGIN: 'ade' } as unknown as Env);
+    expect(res.status).toBe(200);
+    const props = await res.json() as any;
+    expect(props.items.length).toBeLessThanOrEqual(20);
+    expect(props.sections.P3.collapsed).toBe(true);
+    expect(props.items.every((item: any) => item.suggestedAction)).toBe(true);
+  });
+
+  it('renders public design language without authentication', async () => {
+    const env = { DB: createMemoryDb(), GITHUB_CLIENT_ID: '', OWNER_LOGIN: 'ade', SESSION_SECRET: 'x' } as unknown as Env;
+    const res = await app.request('/design', {}, env);
+    const html = await res.text();
+    expect(res.status).toBe(200);
+    expect(html).toContain('Interface kit');
+    expect(html).toContain('Dashboard row');
+    expect(html).toContain('Deploy to Cloudflare');
+  });
+
+  it('creates OAuth state in D1 on login and redirects to GitHub', async () => {
+    const db = createMemoryDb();
+    const env = { DB: db, GITHUB_CLIENT_ID: 'client', OWNER_LOGIN: 'ade', SESSION_SECRET: 'secret' } as unknown as Env;
+    const res = await app.request('/login', {}, env);
+    expect(res.status).toBe(302);
+    expect(res.headers.get('location')).toContain('github.com/login/oauth/authorize');
+    const state = await db.prepare('SELECT * FROM oauth_states').all();
+    expect(state.results).toHaveLength(1);
+  });
+
+  it('refresh uses scan path and persists scan run plus github changes', async () => {
+    const db = createMemoryDb();
+    await db.prepare("INSERT INTO sessions (id, github_login, github_id, access_token, expires_at, created_at) VALUES ('sid','ade','1','tok','2999-01-01T00:00:00Z','2026-01-01T00:00:00Z')").run();
+    const env = { DB: db, OWNER_LOGIN: 'ade', TEST_GITHUB_FIXTURES: 'true' } as unknown as Env;
+    const res = await app.request('/refresh', { method: 'POST', headers: { Cookie: 'sunrise_session=sid' } }, env);
+    expect(res.status).toBe(302);
+    expect((await db.prepare('SELECT * FROM scan_runs').all()).results.length).toBe(1);
+    expect((await db.prepare('SELECT * FROM github_changes').all()).results.length).toBeGreaterThan(0);
+  });
+});
