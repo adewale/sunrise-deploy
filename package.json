@@ -1,5 +1,5 @@
 {
-  "name": "sunrise-deploy",
+  "name": "sunrise",
   "version": "0.1.0",
   "private": true,
   "description": "Self-hosted GitHub action dashboard on Cloudflare.",
@@ -23,9 +23,6 @@
       },
       "OWNER_LOGIN": {
         "description": "Your GitHub username. Sunrise only allows this single owner to sign in."
-      },
-      "OWNER_ID": {
-        "description": "Optional immutable GitHub numeric user ID for stronger owner validation."
       },
       "SESSION_SECRET": {
         "description": "Random long secret used for local session hardening. Generate with `openssl rand -base64 32`."

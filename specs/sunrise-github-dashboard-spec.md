@@ -157,7 +157,7 @@ Preferred v1:
 ```txt
 public homepage
 → /login with GitHub OAuth
-→ validate GitHub identity against OWNER_LOGIN / OWNER_ID / allowed email
+→ validate GitHub identity against OWNER_LOGIN
 → store one session in D1
 → dashboard reads the signed-in owner's GitHub data
 ```
@@ -249,7 +249,7 @@ The public distribution path can be:
 4. Create/configure a GitHub OAuth app or GitHub App for the deployed URL.
 5. Click Deploy to Cloudflare.
 6. Bind D1 + Queues.
-7. Set GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET, OWNER_LOGIN/OWNER_ID, SESSION_SECRET.
+7. Set GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET, OWNER_LOGIN, SESSION_SECRET.
 8. Visit your deployed homepage.
 9. Sign in with GitHub.
 ```
@@ -279,7 +279,7 @@ Tasche is useful prior art because it is also a personal Cloudflare app with Git
 Good lessons to keep:
 
 - **Setup checklist matters.** Tasche's UI tells the deployer exactly which bindings/secrets are missing and how to fix them.
-- **Whitelist owner identity.** Tasche uses `ALLOWED_EMAILS`; this project can use simpler `OWNER_LOGIN` / `OWNER_ID` checks or no login at all behind Cloudflare Access.
+- **Whitelist owner identity.** Tasche uses `ALLOWED_EMAILS`; this project can use simpler `OWNER_LOGIN` checks or no login at all behind Cloudflare Access.
 - **CSRF state is mandatory if OAuth exists.** Store state with short TTL and delete after use.
 - **Session cookies need sane defaults.** HttpOnly, Secure on HTTPS, SameSite=Lax, path `/`, finite TTL.
 - **Revocation should be simple.** Tasche re-checks `ALLOWED_EMAILS` and deletes sessions on revocation.
@@ -291,7 +291,7 @@ What to adapt for Sunrise:
 - Keep GitHub OAuth login/callback/logout/session.
 - Keep short-lived OAuth state, but store it in D1 instead of KV for v1.
 - Keep an opaque session ID cookie with session rows in D1.
-- Keep owner whitelist: `OWNER_LOGIN`, `OWNER_ID`, or allowed email.
+- Keep owner whitelist: `OWNER_LOGIN`.
 - Keep setup checklist for missing OAuth/D1/Queue/Cron config.
 - Remove multi-user account growth: no teams, tenants, billing, or account settings.
 - Avoid a D1 users table unless it is clearly simpler than storing the signed-in owner profile in D1 `settings` / `sessions`.
@@ -730,7 +730,6 @@ Use GitHub OAuth for owner sign-in and API access.
 GITHUB_CLIENT_ID      → OAuth app/client configured for this deployment
 GITHUB_CLIENT_SECRET  → server-side secret
 OWNER_LOGIN           → expected GitHub login
-OWNER_ID              → optional stronger immutable GitHub user id check
 SESSION_SECRET        → signs/verifies local session cookie
 ```
 
@@ -1715,7 +1714,7 @@ Before adding features, prove the deploy path:
 
 1. create D1;
 2. create Queue;
-3. set `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`, `OWNER_LOGIN` / `OWNER_ID`, and `SESSION_SECRET` secrets;
+3. set `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`, `OWNER_LOGIN`, and `SESSION_SECRET` secrets;
 4. configure Cron Trigger;
 5. sign in with GitHub as the configured owner;
 6. run manual scan;

@@ -1,9 +1,10 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import app from '../src/app';
 import type { Env } from '../src/env';
 import { createMemoryDb } from './memory-db';
 
 describe('Sunrise app routes', () => {
+  afterEach(() => vi.restoreAllMocks());
   it('renders public landing with deploy CTA and setup checklist when signed out', async () => {
     const env = { DB: createMemoryDb(), GITHUB_CLIENT_ID: '', OWNER_LOGIN: 'ade', SESSION_SECRET: 'x' } as unknown as Env;
     const res = await app.request('/', {}, env);
@@ -38,7 +39,55 @@ describe('Sunrise app routes', () => {
     expect(html).toContain('Deploy to Cloudflare');
   });
 
+  it('diagnoses invalid GitHub OAuth client IDs before sending users to a 404', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      if (String(url).startsWith('https://github.com/login/oauth/authorize')) return new Response('not found', { status: 404 });
+      if (String(url).startsWith('https://api.github.com/users/ade')) return Response.json({ login: 'ade' });
+      return new Response('ok');
+    }));
+    const env = { DB: createMemoryDb(), GITHUB_CLIENT_ID: 'Y37UUaM_wXXgc3k', GITHUB_CLIENT_SECRET: 'secret', OWNER_LOGIN: 'ade', SESSION_SECRET: 'long-enough-session-secret' } as unknown as Env;
+    const res = await app.request('/setup?json', {}, env);
+    const props = await res.json() as any;
+    const oauth = props.checks.find((check: any) => check.id === 'github_client_id');
+    expect(oauth.status).toBe('fail');
+    expect(oauth.message).toContain('GitHub returned 404');
+    expect(oauth.fix).toContain('OAuth App');
+  });
+
+  it('reports setup readiness for D1, queue, owner login, secrets, and callback URL', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      if (String(url).startsWith('https://github.com/login/oauth/authorize')) return new Response('', { status: 302 });
+      if (String(url).startsWith('https://api.github.com/users/ade')) return Response.json({ login: 'ade' });
+      return new Response('ok');
+    }));
+    const env = { DB: createMemoryDb(), GITHUB_QUEUE: {} as Queue, GITHUB_CLIENT_ID: 'Ov23liValidClientId', GITHUB_CLIENT_SECRET: 'secret', OWNER_LOGIN: 'ade', SESSION_SECRET: 'long-enough-session-secret' } as unknown as Env;
+    const res = await app.request('/setup?json', {}, env);
+    const props = await res.json() as any;
+    expect(props.callbackUrl).toBe('http://localhost/callback');
+    expect(props.ready).toBe(true);
+    expect(props.checks.every((check: any) => ['pass', 'warn'].includes(check.status))).toBe(true);
+  });
+
+  it('does not redirect to GitHub when OAuth client ID would produce GitHub 404', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      if (String(url).startsWith('https://github.com/login/oauth/authorize')) return new Response('not found', { status: 404 });
+      if (String(url).startsWith('https://api.github.com/users/ade')) return Response.json({ login: 'ade' });
+      return new Response('ok');
+    }));
+    const env = { DB: createMemoryDb(), GITHUB_QUEUE: {} as Queue, GITHUB_CLIENT_ID: 'Y37UUaM_wXXgc3k', GITHUB_CLIENT_SECRET: 'secret', OWNER_LOGIN: 'ade', SESSION_SECRET: 'long-enough-session-secret' } as unknown as Env;
+    const res = await app.request('/login', {}, env);
+    const html = await res.text();
+    expect(res.status).toBe(400);
+    expect(res.headers.get('location')).toBeNull();
+    expect(html).toContain('GitHub returned 404');
+    expect(html).toContain('OAuth App');
+  });
+
   it('creates OAuth state in D1 on login and redirects to GitHub', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      if (String(url).startsWith('https://github.com/login/oauth/authorize')) return new Response('', { status: 302 });
+      return new Response('ok');
+    }));
     const db = createMemoryDb();
     const env = { DB: db, GITHUB_CLIENT_ID: 'client', OWNER_LOGIN: 'ade', SESSION_SECRET: 'secret' } as unknown as Env;
     const res = await app.request('/login', {}, env);

@@ -11,10 +11,11 @@ Deploy-button flow, following the Tasche pattern:
 1. Click **Deploy to Cloudflare**.
 2. Cloudflare forks the repo into your GitHub account.
 3. Cloudflare parses `wrangler.jsonc` and provisions D1 + Queues.
-4. Cloudflare prompts for secrets listed in `.dev.vars.example`, using descriptions from `package.json` `cloudflare.bindings`.
-5. Cloudflare runs `npm run build` and `npm run deploy`.
-6. Visit the deployed Worker URL.
-7. The Sunrise homepage shows a first-boot checklist and the exact GitHub OAuth callback URL for that instance.
+4. On the Cloudflare setup page, you can accept or customize the Worker name and resource names. Any changes are written into the fork Cloudflare creates for you — no local checkout or manual Wrangler edit is required.
+5. Cloudflare prompts for secrets listed in `.dev.vars.example`, using descriptions from `package.json` `cloudflare.bindings`.
+6. Cloudflare runs `npm run build` and `npm run deploy`.
+7. Visit the deployed Worker URL.
+8. The Sunrise homepage shows a first-boot checklist and the exact GitHub OAuth callback URL for that instance.
 
 ## Post-deploy steps
 
@@ -22,11 +23,10 @@ Deploy-button flow, following the Tasche pattern:
    - **Homepage URL:** your deployed Worker URL.
    - **Authorization callback URL:** `<your-worker-url>/callback`.
 2. Add secrets in Cloudflare dashboard under **Workers & Pages → sunrise → Settings → Variables and Secrets**:
-   - `GITHUB_CLIENT_ID`
-   - `GITHUB_CLIENT_SECRET`
-   - `OWNER_LOGIN`
-   - optional `OWNER_ID`
-   - `SESSION_SECRET`
+   - `GITHUB_CLIENT_ID` — the **Client ID** from a GitHub **OAuth App**. If GitHub `/login/oauth/authorize` returns 404, this value is usually wrong.
+   - `GITHUB_CLIENT_SECRET` — the **Client secret** from the same OAuth App.
+   - `OWNER_LOGIN` — your GitHub username, for example `adewale`.
+   - `SESSION_SECRET` — a long random string.
 3. Reload the Worker URL.
 4. Sign in with GitHub.
 5. Click **Manual refresh** to create the first scan.
@@ -37,8 +37,8 @@ Deploy-button flow, following the Tasche pattern:
 npm install
 npm run verify
 wrangler d1 create sunrise
+# copy the returned database_id into wrangler.jsonc for manual CLI deploys
 wrangler queues create sunrise-github
-# update wrangler.jsonc with your D1 database id if deploying manually
 wrangler d1 migrations apply DB --remote
 wrangler secret put GITHUB_CLIENT_ID
 wrangler secret put GITHUB_CLIENT_SECRET
@@ -48,6 +48,12 @@ wrangler deploy
 ```
 
 Cloudflare Access can be added as an optional extra protection layer, but GitHub OAuth owner sign-in is the product auth model.
+
+## Dogfooding the Deploy to Cloudflare path
+
+The Deploy to Cloudflare flow is the intended path. Cloudflare reads the default names from `wrangler.jsonc`, shows them in the setup page, provisions resources, and writes the selected names/IDs into the fork it creates. Users should not need to edit Wrangler locally.
+
+Changing OAuth secret values to `sunrise-deploy` does not rename infrastructure. If testing in an account that already has a queue named `sunrise-github` with a consumer, either delete the old queue/Worker or choose a unique queue name in the Cloudflare setup page. Queue names are account-level and a Cloudflare Queue can only have one consumer.
 
 ## Why the app shows onboarding
 
