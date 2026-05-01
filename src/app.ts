@@ -11,13 +11,13 @@ const app = new Hono<{ Bindings: Bindings }>();
 app.get('/', async (c) => {
   const session = await getSession(c.env.DB, c.req.header('Cookie') ?? null);
   if (session) return c.redirect('/dashboard');
-  const missing = setupMissing(c.env);
-  if (c.req.query('json') !== undefined) return c.json({ product: 'Sunrise', signedIn: false, setup: { missing } });
+  const setup = await setupDiagnostics(c.env, c.req.url);
+  if (c.req.query('json') !== undefined) return c.json({ product: 'Sunrise', signedIn: false, setup });
   return html(`
     <section class="hero panel">
     <p class="actions"><a class="button primary" href="${c.env.GITHUB_REPO_URL ?? 'https://github.com/adewale/sunrise'}">Deploy your own</a> <a class="button ghost" href="/login">Sign in with GitHub</a></p>
     <p class="muted">Single-user, read-only by default, and your snapshots stay in your Cloudflare account.</p></section>
-    ${renderSetupGuide(missing, c.req.url)}
+    ${renderSetupGuide(setup)}
   `);
 });
 
@@ -25,15 +25,26 @@ app.get('/design', (c) => {
   return html(renderDesignLanguage());
 });
 
+app.get('/setup', async (c) => {
+  const setup = await setupDiagnostics(c.env, c.req.url);
+  if (c.req.query('json') !== undefined || c.req.header('Accept')?.includes('application/json')) return c.json(setup);
+  return html(renderSetupGuide(setup));
+});
+
 app.get('/login', async (c) => {
   const missing = setupMissing(c.env).filter((m) => m !== 'GITHUB_CLIENT_SECRET');
   if (missing.length) return c.text(`Missing setup: ${missing.join(', ')}`, 500);
+  const callback = new URL(c.req.url); callback.pathname = '/callback'; callback.search = '';
+  const clientCheck = await checkGitHubClientId(c.env.GITHUB_CLIENT_ID!, callback.toString());
+  if (clientCheck.status === 'fail') {
+    const setup = await setupDiagnostics(c.env, c.req.url);
+    return html(`<section class="section panel"><p class="eyebrow">Sign-in blocked</p><h1>OAuth setup needs attention</h1><p class="muted">Sunrise checked GitHub before redirecting so you do not land on a confusing GitHub 404.</p>${renderSetupChecks([clientCheck])}<p><a class="button primary" href="/setup">Open setup diagnostics</a></p></section>${renderSetupGuide(setup)}`, 400);
+  }
   const state = crypto.randomUUID();
   const verifier = crypto.randomUUID();
   const now = new Date();
   const expires = new Date(now.getTime() + 10 * 60 * 1000).toISOString();
   await retryD1(() => c.env.DB.prepare('INSERT INTO oauth_states (state, code_verifier, expires_at, created_at) VALUES (?, ?, ?, ?)').bind(state, verifier, expires, now.toISOString()).run());
-  const callback = new URL(c.req.url); callback.pathname = '/callback'; callback.search = '';
   const url = new URL('https://github.com/login/oauth/authorize');
   url.searchParams.set('client_id', c.env.GITHUB_CLIENT_ID!);
   url.searchParams.set('redirect_uri', callback.toString());
@@ -155,6 +166,91 @@ function setupMissing(env: Env) {
   return ['DB', 'GITHUB_CLIENT_ID', 'GITHUB_CLIENT_SECRET', 'OWNER_LOGIN', 'SESSION_SECRET'].filter((key) => !(env as any)[key]);
 }
 
+type SetupCheck = { id: string; label: string; status: 'pass' | 'warn' | 'fail'; message: string; fix?: string };
+
+type SetupDiagnostics = {
+  ready: boolean;
+  origin: string;
+  callbackUrl: string;
+  missing: string[];
+  checks: SetupCheck[];
+};
+
+async function setupDiagnostics(env: Env, requestUrl: string): Promise<SetupDiagnostics> {
+  const origin = new URL(requestUrl).origin;
+  const callbackUrl = `${origin}/callback`;
+  const checks: SetupCheck[] = [];
+  const add = (check: SetupCheck) => checks.push(check);
+
+  if (env.DB) {
+    try {
+      await env.DB.prepare('SELECT 1 FROM sessions LIMIT 1').first();
+      add({ id: 'd1_schema', label: 'D1 database', status: 'pass', message: 'D1 is connected and the Sunrise schema is present.' });
+    } catch (error) {
+      add({ id: 'd1_schema', label: 'D1 database', status: 'fail', message: 'D1 is bound, but the Sunrise schema is missing or inaccessible.', fix: 'Run D1 migrations for the DB binding, then redeploy.' });
+    }
+  } else {
+    add({ id: 'd1_schema', label: 'D1 database', status: 'fail', message: 'D1 binding DB is missing.', fix: 'Deploy to Cloudflare should provision D1. For manual deploys, create D1 and bind it as DB.' });
+  }
+
+  add(env.GITHUB_QUEUE
+    ? { id: 'queue', label: 'Queue binding', status: 'pass', message: 'Queue binding GITHUB_QUEUE is present.' }
+    : { id: 'queue', label: 'Queue binding', status: 'fail', message: 'Queue binding GITHUB_QUEUE is missing.', fix: 'Deploy to Cloudflare should provision Queues. If a queue name collides, choose a unique queue name in the deploy setup.' });
+
+  if (env.OWNER_LOGIN) {
+    const owner = await checkOwnerLogin(env.OWNER_LOGIN);
+    add(owner);
+  } else {
+    add({ id: 'owner_login', label: 'GitHub owner', status: 'fail', message: 'OWNER_LOGIN is missing.', fix: 'Set OWNER_LOGIN to your GitHub username, for example `adewale`.' });
+  }
+
+  add(env.SESSION_SECRET && env.SESSION_SECRET.length >= 16
+    ? { id: 'session_secret', label: 'Session secret', status: 'pass', message: 'SESSION_SECRET is set.' }
+    : { id: 'session_secret', label: 'Session secret', status: 'fail', message: 'SESSION_SECRET is missing or too short.', fix: 'Set SESSION_SECRET to a long random string, for example from `openssl rand -base64 32`.' });
+
+  if (env.GITHUB_CLIENT_ID) {
+    add(await checkGitHubClientId(env.GITHUB_CLIENT_ID, callbackUrl));
+  } else {
+    add({ id: 'github_client_id', label: 'GitHub OAuth client ID', status: 'fail', message: 'GITHUB_CLIENT_ID is missing.', fix: 'Create a GitHub OAuth App and copy its Client ID. Do not use a GitHub App ID or Cloudflare value.' });
+  }
+
+  add(env.GITHUB_CLIENT_SECRET
+    ? { id: 'github_client_secret', label: 'GitHub OAuth client secret', status: 'warn', message: 'GITHUB_CLIENT_SECRET is present. GitHub only verifies it during sign-in.' }
+    : { id: 'github_client_secret', label: 'GitHub OAuth client secret', status: 'fail', message: 'GITHUB_CLIENT_SECRET is missing.', fix: 'Copy the Client secret from the same GitHub OAuth App as GITHUB_CLIENT_ID.' });
+
+  add({ id: 'callback_url', label: 'OAuth callback URL', status: 'pass', message: callbackUrl, fix: 'Use this exact URL as the GitHub OAuth App Authorization callback URL.' });
+
+  return { ready: checks.every((check) => check.status !== 'fail'), origin, callbackUrl, missing: setupMissing(env), checks };
+}
+
+async function checkOwnerLogin(login: string): Promise<SetupCheck> {
+  try {
+    const res = await fetch(`https://api.github.com/users/${encodeURIComponent(login)}`, { headers: { Accept: 'application/vnd.github+json', 'User-Agent': 'sunrise-dashboard' } });
+    if (res.ok) return { id: 'owner_login', label: 'GitHub owner', status: 'pass', message: `GitHub user ${login} exists.` };
+    return { id: 'owner_login', label: 'GitHub owner', status: 'fail', message: `GitHub user ${login} was not found.`, fix: 'Set OWNER_LOGIN to your exact GitHub username.' };
+  } catch {
+    return { id: 'owner_login', label: 'GitHub owner', status: 'warn', message: `Could not verify ${login} with GitHub right now.` };
+  }
+}
+
+async function checkGitHubClientId(clientId: string, callbackUrl: string): Promise<SetupCheck> {
+  const url = new URL('https://github.com/login/oauth/authorize');
+  url.searchParams.set('client_id', clientId);
+  url.searchParams.set('redirect_uri', callbackUrl);
+  url.searchParams.set('state', 'sunrise-setup-check');
+  url.searchParams.set('scope', 'read:user user:email notifications repo');
+  try {
+    const res = await fetch(url.toString(), { method: 'GET', redirect: 'manual' });
+    if (res.status === 404) {
+      return { id: 'github_client_id', label: 'GitHub OAuth client ID', status: 'fail', message: 'GitHub returned 404 for this OAuth authorize URL.', fix: 'Use the Client ID from a GitHub OAuth App. A GitHub App ID/client value or typo will send users to a GitHub 404.' };
+    }
+    if (res.status >= 200 && res.status < 400) return { id: 'github_client_id', label: 'GitHub OAuth client ID', status: 'pass', message: 'GitHub accepts this OAuth client ID.' };
+    return { id: 'github_client_id', label: 'GitHub OAuth client ID', status: 'warn', message: `GitHub returned HTTP ${res.status} while checking the client ID.`, fix: 'If sign-in fails, recreate the GitHub OAuth App and copy the Client ID again.' };
+  } catch {
+    return { id: 'github_client_id', label: 'GitHub OAuth client ID', status: 'warn', message: 'Could not reach GitHub to verify the OAuth client ID.' };
+  }
+}
+
 function scanStatus(run: Record<string, any> | null) {
   if (!run) return 'stale';
   if (run.status === 'failed' || run.status === 'running') return run.status;
@@ -200,20 +296,22 @@ function renderItem(item: GitHubActionItem) {
   return `<article class="item"><div class="item-main"><div class="chips">${chips}</div><a class="item-title" href="${item.url}">${escapeHtml(item.title)}</a><p>${escapeHtml(item.reason)}</p><p class="action">${escapeHtml(item.suggestedAction)}</p></div><form method="post" action="/ignore"><input type="hidden" name="canonicalSubjectKey" value="${escapeHtml(item.canonicalSubjectKey)}"><button class="button quiet">Ignore</button></form></article>`;
 }
 
-function renderSetupGuide(missing: string[], requestUrl: string) {
-  const origin = new URL(requestUrl).origin;
-  const callbackUrl = `${origin}/callback`;
+function renderSetupGuide(setup: SetupDiagnostics) {
   const deployUrl = 'https://deploy.workers.cloudflare.com/?url=https://github.com/adewale/sunrise&paid=true';
   const dashboardPath = 'Workers & Pages → sunrise → Settings → Variables and Secrets';
   const steps = [
     ['Deploy your own copy', 'Use the Deploy to Cloudflare button. Cloudflare forks the repo, provisions D1 and Queues from wrangler.jsonc, runs the build, and enables deploys from your fork.'],
-    ['Create a GitHub OAuth app', `Use Homepage URL ${origin} and Authorization callback URL ${callbackUrl}.`],
+    ['Create a GitHub OAuth app', `Use Homepage URL ${setup.origin} and Authorization callback URL ${setup.callbackUrl}.`],
     ['Add secrets in Cloudflare', `Open ${dashboardPath}. Set GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET, OWNER_LOGIN, and SESSION_SECRET.`],
-    ['Reload this page', 'The checklist reads this instance configuration. When required secrets are present, Sign in with GitHub becomes the happy path.'],
+    ['Reload this page', 'The checklist verifies this instance configuration against Cloudflare, D1, Queues, and GitHub where possible.'],
     ['Sign in and refresh', 'Sign in as the configured owner, then use Manual refresh to populate the first dashboard snapshot.'],
   ];
-  const status = missing.length ? `<p class="setup-status">Needs ${missing.length} value${missing.length === 1 ? '' : 's'}: ${missing.map((m) => `<code>${escapeHtml(m)}</code>`).join(' ')}</p>` : '<p class="setup-status ready">Configuration looks ready. Sign in to scan GitHub.</p>';
-  return `<section class="panel setup"><div class="section-head"><div><p class="eyebrow">First boot</p><h2>Setup checklist</h2></div><span class="badge">${missing.length ? 'action needed' : 'ready'}</span></div>${status}<div class="deploy-card"><div><strong>Start with one-click deploy</strong><p>Best for most users: no local CLI required for the first deployment.</p></div><a class="button primary" href="${deployUrl}">Deploy to Cloudflare</a></div><div class="config-card"><p><span>Homepage URL</span><code>${escapeHtml(origin)}</code></p><p><span>Callback URL</span><code>${escapeHtml(callbackUrl)}</code></p></div><ol class="setup-steps">${steps.map(([title, copy], index) => `<li><span class="step-number">${index + 1}</span><div><strong>${escapeHtml(title)}</strong><p>${escapeHtml(copy)}</p></div></li>`).join('')}</ol><p class="muted">Sunrise should never ask users to send tokens to a hosted service. OAuth secrets and GitHub data stay in the deployer’s Cloudflare account.</p></section>`;
+  const status = setup.ready ? '<p class="setup-status ready">Configuration looks ready. Sign in to scan GitHub.</p>' : '<p class="setup-status">Setup needs attention. Fix failing checks below, then reload.</p>';
+  return `<section class="panel setup"><div class="section-head"><div><p class="eyebrow">First boot</p><h2>Setup checklist</h2></div><span class="badge">${setup.ready ? 'ready' : 'action needed'}</span></div>${status}${renderSetupChecks(setup.checks)}<div class="deploy-card"><div><strong>Start with one-click deploy</strong><p>Best for most users: no local CLI required for the first deployment.</p></div><a class="button primary" href="${deployUrl}">Deploy to Cloudflare</a></div><div class="config-card"><p><span>Homepage URL</span><code>${escapeHtml(setup.origin)}</code></p><p><span>Callback URL</span><code>${escapeHtml(setup.callbackUrl)}</code></p></div><ol class="setup-steps">${steps.map(([title, copy], index) => `<li><span class="step-number">${index + 1}</span><div><strong>${escapeHtml(title)}</strong><p>${escapeHtml(copy)}</p></div></li>`).join('')}</ol><p class="muted">Sunrise should never ask users to send tokens to a hosted service. OAuth secrets and GitHub data stay in the deployer’s Cloudflare account.</p></section>`;
+}
+
+function renderSetupChecks(checks: SetupCheck[]) {
+  return `<div class="setup-checks">${checks.map((check) => `<article class="setup-check ${check.status}"><span class="check-dot">${check.status === 'pass' ? '✓' : check.status === 'warn' ? '!' : '×'}</span><div><strong>${escapeHtml(check.label)}</strong><p>${escapeHtml(check.message)}</p>${check.fix ? `<p class="fix">${escapeHtml(check.fix)}</p>` : ''}</div></article>`).join('')}</div>`;
 }
 
 function html(body: string, status = 200) {
@@ -230,7 +328,7 @@ function designCss() {
 .skip-link{position:fixed;left:16px;top:12px;z-index:30;transform:translateY(-160%);background:var(--ink);color:var(--surface);padding:10px 12px;border-radius:8px}.skip-link:focus{transform:none}.theme-toggle{position:fixed;z-index:20;right:28px;top:28px;width:62px;height:62px;padding:0;border:1px solid var(--line-strong);border-radius:999px;background:var(--surface-3);box-shadow:var(--button-shadow);cursor:pointer;transition:transform .22s cubic-bezier(.2,0,0,1),background .22s ease,box-shadow .22s ease}.theme-toggle:hover{transform:translateY(-1px) rotate(8deg)}.theme-toggle:active{transform:scale(.96)}.sun-icon,.moon-icon{position:absolute;inset:12px;border-radius:999px;transition:opacity .24s cubic-bezier(.2,0,0,1),transform .24s cubic-bezier(.2,0,0,1),filter .24s cubic-bezier(.2,0,0,1)}.sun-icon{background:radial-gradient(circle,#ffd89a,#ffb23f);box-shadow:0 0 28px rgba(255,178,63,.44);opacity:1;transform:scale(1);filter:blur(0)}.moon-icon{inset:16px 20px 16px 8px;border-radius:999px;background:transparent;box-shadow:14px 0 0 0 #dbe8fb,17px 0 18px rgba(151,185,255,.22);opacity:0;transform:scale(.25) rotate(-10deg);filter:blur(4px)}.moon-icon:after{content:"";position:absolute;left:25px;top:7px;width:3px;height:3px;border-radius:999px;background:rgba(92,114,142,.34);box-shadow:5px 9px 0 1px rgba(92,114,142,.22),-2px 18px 0 0 rgba(92,114,142,.18);pointer-events:none}html[data-theme=dark] .sun-icon{opacity:0;transform:scale(.25);filter:blur(4px)}html[data-theme=dark] .moon-icon{opacity:1;transform:scale(1) rotate(-18deg);filter:blur(0)}
 h1,h2,p{margin-block-start:0}h1,h2{text-wrap:balance;font-family:var(--font-display);font-variation-settings:"SOFT" 60,"WONK" 1}h1{font-size:clamp(58px,10vw,128px);font-weight:850;letter-spacing:-.07em;line-height:.82;margin-bottom:24px}h2{font-size:28px;font-weight:760;letter-spacing:-.04em;line-height:.95;margin-bottom:0}.muted,.empty{color:var(--muted);line-height:1.55;text-wrap:pretty}.eyebrow{font-family:var(--font-mono);font-size:11px;font-weight:600;letter-spacing:.14em;text-transform:uppercase;color:color-mix(in srgb,var(--accent) 72%,var(--ink));margin-bottom:14px}.actions{display:flex;gap:12px;align-items:center;flex-wrap:wrap;min-width:0}.button{min-height:40px;display:inline-flex;align-items:center;justify-content:center;border:1px solid var(--line-strong);border-radius:8px;padding:0 16px;font:inherit;font-weight:700;letter-spacing:-.01em;text-decoration:none;color:var(--ink);background:var(--surface-2);box-shadow:var(--button-shadow);transition:transform .16s ease,box-shadow .16s ease,background .16s ease,border-color .16s ease}.button:hover{transform:translateY(-1px);border-color:var(--line-strong)}.button:active{transform:scale(.96)}.primary{background:var(--accent);color:var(--accent-ink);border-color:color-mix(in srgb,var(--accent) 55%,var(--line-strong))}.ghost,.quiet{background:var(--surface-2)}.quiet{color:var(--muted)}:focus-visible{outline:3px solid var(--focus);outline-offset:3px}
 .metrics{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:12px;margin:0}.metric{grid-column:span 3;min-width:0;padding:18px;border-radius:10px}.metric span{display:block;color:var(--muted);font-size:13px;font-weight:600}.metric strong{font-family:var(--font-display);font-variant-numeric:tabular-nums;font-size:38px;font-weight:780;letter-spacing:-.055em}.item-list{display:grid;gap:10px}.item,.deploy-card,.setup-steps li{background:var(--surface-2);border:1px solid var(--line);border-radius:var(--inner);box-shadow:0 1px 0 rgba(255,255,255,.22) inset,0 1px 2px rgba(0,0,0,.06)}.item{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:18px;align-items:center;padding:16px;transition:background-color .42s cubic-bezier(.2,0,0,1),border-color .42s cubic-bezier(.2,0,0,1),box-shadow .42s cubic-bezier(.2,0,0,1)}.item-main{min-width:0}.item-title{display:block;margin:8px 0 6px;color:var(--ink);font-size:19px;font-weight:700;letter-spacing:-.025em;line-height:1.12;text-decoration:none}.item-title:hover{text-decoration:underline;text-decoration-thickness:2px;text-underline-offset:3px}.item p{margin-bottom:6px;color:var(--muted);line-height:1.35}.item .action{color:var(--ink);font-weight:700}.chips{display:flex;gap:6px;flex-wrap:wrap}.chip,.badge{display:inline-flex;align-items:center;min-height:24px;padding:0 9px;border-radius:6px;background:var(--surface-3);border:1px solid var(--line);color:color-mix(in srgb,var(--accent) 45%,var(--ink));font-family:var(--font-mono);font-size:11px;font-weight:600;letter-spacing:-.02em}.priority-p0{border-color:color-mix(in srgb,#df6f59 44%,var(--line))}.priority-p1{border-color:color-mix(in srgb,var(--accent) 48%,var(--line))}.priority-p2{border-color:color-mix(in srgb,#5f8f6a 36%,var(--line))}
-.setup-status,.config-card{border:1px solid var(--line);border-radius:var(--inner);background:var(--surface-2);padding:12px;color:var(--ink)}.setup-status.ready{color:#315d38}html[data-theme=dark] .setup-status.ready{color:#add6b5}.deploy-card,.config-card{display:grid;grid-template-columns:minmax(0,1fr) auto;justify-content:space-between;gap:16px;align-items:center;margin-top:12px;padding:14px}.deploy-card p{margin:4px 0 0;color:var(--muted)}.config-card{grid-template-columns:1fr;align-items:stretch}.config-card p{display:grid;grid-template-columns:minmax(140px,auto) minmax(0,1fr);gap:12px;margin:0;color:var(--muted)}.config-card code{display:block;min-width:0;overflow:auto;white-space:nowrap}.setup-steps{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;padding:0;margin:16px 0 0;list-style:none}.setup-steps li{display:grid;grid-template-columns:28px minmax(0,1fr);gap:12px;padding:14px}.setup-steps p{margin:4px 0 0;color:var(--muted);text-wrap:pretty}.step-number{height:28px;display:grid;place-items:center;border-radius:7px;background:var(--accent);color:var(--accent-ink);font-family:var(--font-mono);font-weight:600;font-variant-numeric:tabular-nums}code{font-family:var(--font-mono);font-size:.92em;padding:2px 5px;border:1px solid var(--line);border-radius:5px;background:color-mix(in srgb,var(--surface-2) 70%,white)}html[data-theme=dark] code{background:rgba(255,255,255,.075)}table{width:100%;min-width:640px;border-collapse:separate;border-spacing:0 8px}th{text-align:left;color:var(--muted);font-family:var(--font-mono);font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.08em}td,th{padding:10px 12px}td{background:var(--surface-2);border-block:1px solid var(--line)}td:first-child{border-left:1px solid var(--line);border-radius:8px 0 0 8px}td:last-child{border-right:1px solid var(--line);border-radius:0 8px 8px 0}
+.setup-status,.config-card{border:1px solid var(--line);border-radius:var(--inner);background:var(--surface-2);padding:12px;color:var(--ink)}.setup-status.ready{color:#315d38}html[data-theme=dark] .setup-status.ready{color:#add6b5}.setup-checks{display:grid;gap:8px;margin:12px 0}.setup-check{display:grid;grid-template-columns:28px minmax(0,1fr);gap:10px;padding:12px;border:1px solid var(--line);border-radius:var(--inner);background:var(--surface-2)}.setup-check p{margin:3px 0 0;color:var(--muted);line-height:1.35}.setup-check .fix{color:var(--ink);font-weight:600}.check-dot{display:grid;place-items:center;width:24px;height:24px;border-radius:999px;background:var(--surface-3);font-family:var(--font-mono);font-size:13px;font-weight:600}.setup-check.pass .check-dot{background:#d8ead4;color:#315d38}.setup-check.warn .check-dot{background:#f7dfad;color:#6b4b26}.setup-check.fail .check-dot{background:#f3c7bd;color:#7b2d21}html[data-theme=dark] .setup-check.pass .check-dot{background:#244633;color:#add6b5}html[data-theme=dark] .setup-check.warn .check-dot{background:#4c3b1f;color:#e1cfa8}html[data-theme=dark] .setup-check.fail .check-dot{background:#4a2525;color:#f0b2a7}.deploy-card,.config-card{display:grid;grid-template-columns:minmax(0,1fr) auto;justify-content:space-between;gap:16px;align-items:center;margin-top:12px;padding:14px}.deploy-card p{margin:4px 0 0;color:var(--muted)}.config-card{grid-template-columns:1fr;align-items:stretch}.config-card p{display:grid;grid-template-columns:minmax(140px,auto) minmax(0,1fr);gap:12px;margin:0;color:var(--muted)}.config-card code{display:block;min-width:0;overflow:auto;white-space:nowrap}.setup-steps{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;padding:0;margin:16px 0 0;list-style:none}.setup-steps li{display:grid;grid-template-columns:28px minmax(0,1fr);gap:12px;padding:14px}.setup-steps p{margin:4px 0 0;color:var(--muted);text-wrap:pretty}.step-number{height:28px;display:grid;place-items:center;border-radius:7px;background:var(--accent);color:var(--accent-ink);font-family:var(--font-mono);font-weight:600;font-variant-numeric:tabular-nums}code{font-family:var(--font-mono);font-size:.92em;padding:2px 5px;border:1px solid var(--line);border-radius:5px;background:color-mix(in srgb,var(--surface-2) 70%,white)}html[data-theme=dark] code{background:rgba(255,255,255,.075)}table{width:100%;min-width:640px;border-collapse:separate;border-spacing:0 8px}th{text-align:left;color:var(--muted);font-family:var(--font-mono);font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.08em}td,th{padding:10px 12px}td{background:var(--surface-2);border-block:1px solid var(--line)}td:first-child{border-left:1px solid var(--line);border-radius:8px 0 0 8px}td:last-child{border-right:1px solid var(--line);border-radius:0 8px 8px 0}
 @media(prefers-reduced-motion:reduce){*,*:before,*:after{transition:none!important;animation:none!important;scroll-behavior:auto!important}}@media(max-width:900px){.metric{grid-column:span 6}.setup-steps{grid-template-columns:1fr}}@media(max-width:760px){main{width:min(100% - 20px,1120px);margin-top:88px;grid-template-columns:repeat(6,minmax(0,1fr));gap:12px}.site-header{top:12px;left:16px;right:84px;min-height:52px}.brand{font-size:30px}.theme-toggle{right:16px;top:16px;width:52px;height:52px}.hero{padding:36px 24px}.metric{grid-column:span 3}.item,.masthead,.deploy-card{grid-template-columns:1fr;align-items:stretch}.section-head,.config-card p{grid-template-columns:1fr}.config-card p{gap:4px}table{min-width:560px}h1{font-size:64px}}@media(max-width:440px){.metric{grid-column:1/-1}.actions .button{width:100%}.hero,.section,.setup,.masthead{padding:20px}.item{padding:14px}h1{font-size:54px}}`;
 }
 
