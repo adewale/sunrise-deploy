@@ -15,7 +15,7 @@ app.get('/', async (c) => {
   if (c.req.query('json') !== undefined) return c.json({ product: 'Sunrise', signedIn: false, setup: { missing } });
   return html(`
     <section class="hero panel">
-    <p class="actions"><a class="button primary" href="${c.env.GITHUB_REPO_URL ?? 'https://github.com/your-org/sunrise'}">Deploy your own</a> <a class="button ghost" href="/login">Sign in with GitHub</a></p>
+    <p class="actions"><a class="button primary" href="${c.env.GITHUB_REPO_URL ?? 'https://github.com/adewale/sunrise'}">Deploy your own</a> <a class="button ghost" href="/login">Sign in with GitHub</a></p>
     <p class="muted">Single-user, read-only by default, and your snapshots stay in your Cloudflare account.</p></section>
     ${renderSetupGuide(missing, c.req.url)}
   `);
@@ -203,7 +203,7 @@ function renderItem(item: GitHubActionItem) {
 function renderSetupGuide(missing: string[], requestUrl: string) {
   const origin = new URL(requestUrl).origin;
   const callbackUrl = `${origin}/callback`;
-  const deployUrl = 'https://deploy.workers.cloudflare.com/?url=https://github.com/your-org/sunrise&paid=true';
+  const deployUrl = 'https://deploy.workers.cloudflare.com/?url=https://github.com/adewale/sunrise&paid=true';
   const dashboardPath = 'Workers & Pages → sunrise → Settings → Variables and Secrets';
   const steps = [
     ['Deploy your own copy', 'Use the Deploy to Cloudflare button. Cloudflare forks the repo, provisions D1 and Queues from wrangler.jsonc, runs the build, and enables deploys from your fork.'],

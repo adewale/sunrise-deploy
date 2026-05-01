@@ -2,7 +2,7 @@
 
 A self-hosted morning dashboard for the GitHub work that needs your attention.
 
-[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/your-org/sunrise&paid=true)
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/adewale/sunrise&paid=true)
 
 Public homepage → GitHub repo → Deploy your own version → own your data.
 

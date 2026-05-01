@@ -4,7 +4,7 @@ Sunrise is single-user and self-hosted. Do not send tokens to a hosted service.
 
 ## Recommended: Deploy to Cloudflare button
 
-[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/your-org/sunrise&paid=true)
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/adewale/sunrise&paid=true)
 
 Deploy-button flow, following the Tasche pattern:
 
