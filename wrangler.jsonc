@@ -4,7 +4,7 @@
   "main": "src/index.ts",
   "compatibility_date": "2026-05-01",
   "d1_databases": [
-    { "binding": "DB", "database_name": "sunrise", "database_id": "1b55c861-4089-4397-b697-421e3d59d0c7", "migrations_dir": "migrations" }
+    { "binding": "DB", "database_name": "sunrise-deploy", "database_id": "56bb0d20-1fcf-4fb2-b659-8526c8af8d77", "migrations_dir": "migrations" }
   ],
   "queues": {
     "producers": [{ "binding": "GITHUB_QUEUE", "queue": "sunrise-deploy-github" }],
