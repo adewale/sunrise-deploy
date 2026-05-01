@@ -18,6 +18,16 @@ describe('Sunrise app routes', () => {
     expect(html).toContain('/assets/sunrise-inertia-client.js');
   });
 
+  it('can render a project landing page without personal setup claims', async () => {
+    const env = { DB: createMemoryDb(), PROJECT_LANDING: 'true', GITHUB_REPO_URL: 'https://github.com/adewale/sunrise' } as unknown as Env;
+    const res = await app.request('/', {}, env);
+    const html = await res.text();
+    expect(html).toContain('Deploy your own');
+    expect(html).toContain('/raw/main/docs/assets/screenshots/dashboard.png');
+    expect(html).not.toContain('Setup needs attention');
+    expect(html).not.toContain('Sign in with GitHub');
+  });
+
   it('serves a progressive Inertia client bundle', async () => {
     const res = await app.request('/assets/sunrise-inertia-client.js', {}, { DB: createMemoryDb() } as unknown as Env);
     const js = await res.text();
@@ -258,6 +268,29 @@ describe('Sunrise app routes', () => {
     expect(res.headers.get('location')).toBeNull();
     expect(html).toContain('GitHub returned 404');
     expect(html).toContain('OAuth App');
+  });
+
+  it('honors explicit OAuth scope override for private repository discovery', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      if (String(url).startsWith('https://github.com/login/oauth/authorize')) return new Response('', { status: 302 });
+      return new Response('ok');
+    }));
+    const db = createMemoryDb();
+    const env = { DB: db, GITHUB_CLIENT_ID: 'client', OWNER_LOGIN: 'ade', SESSION_SECRET: 'secret', GITHUB_OAUTH_SCOPES: 'read:user user:email notifications repo' } as unknown as Env;
+    const res = await app.request('/login', {}, env);
+    const scope = new URL(res.headers.get('location') ?? '').searchParams.get('scope');
+    expect(scope).toBe('read:user user:email notifications repo');
+  });
+
+  it('renders accessible controls and landmarks for critical interactions', async () => {
+    const db = createMemoryDb();
+    await db.prepare("INSERT INTO sessions (id, github_login, github_id, access_token, expires_at, created_at) VALUES ('sid','ade','1','tok','2999-01-01T00:00:00Z','2026-01-01T00:00:00Z')").run();
+    const html = await (await app.request('/dashboard', { headers: { Cookie: 'sunrise_session=sid' } }, { DB: db, OWNER_LOGIN: 'ade' } as unknown as Env)).text();
+    expect(html).toContain('href="#content"');
+    expect(html).toContain('aria-label="Settings"');
+    expect(html).toContain('aria-label="Toggle dark mode"');
+    expect(html).toContain('aria-pressed="false"');
+    expect(html).toContain('aria-label="Dashboard statistics"');
   });
 
   it('creates OAuth state in D1 on login and redirects to GitHub', async () => {
