@@ -7,8 +7,8 @@
     { "binding": "DB", "database_name": "sunrise", "database_id": "1b55c861-4089-4397-b697-421e3d59d0c7", "migrations_dir": "migrations" }
   ],
   "queues": {
-    "producers": [{ "binding": "GITHUB_QUEUE", "queue": "sunrise-github" }],
-    "consumers": [{ "queue": "sunrise-github" }]
+    "producers": [{ "binding": "GITHUB_QUEUE", "queue": "sunrise-deploy-github" }],
+    "consumers": [{ "queue": "sunrise-deploy-github" }]
   },
   "triggers": { "crons": ["0 12 * * *"] },
   "vars": {
