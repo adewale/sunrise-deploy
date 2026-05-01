@@ -1,0 +1,48 @@
+{
+  "name": "sunrise",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Self-hosted GitHub action dashboard on Cloudflare.",
+  "type": "module",
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "types:cf": "wrangler types",
+    "verify": "npm run types:cf && npm run typecheck && npm test",
+    "build": "npm run typecheck",
+    "dev": "wrangler dev",
+    "deploy": "wrangler d1 migrations apply DB --remote && wrangler deploy"
+  },
+  "cloudflare": {
+    "bindings": {
+      "GITHUB_CLIENT_ID": {
+        "description": "GitHub OAuth App Client ID. Create an OAuth App at https://github.com/settings/developers after Cloudflare shows your workers.dev URL."
+      },
+      "GITHUB_CLIENT_SECRET": {
+        "description": "GitHub OAuth App Client Secret from the same OAuth App. Store as a secret."
+      },
+      "OWNER_LOGIN": {
+        "description": "Your GitHub username. Sunrise only allows this single owner to sign in."
+      },
+      "OWNER_ID": {
+        "description": "Optional immutable GitHub numeric user ID for stronger owner validation."
+      },
+      "SESSION_SECRET": {
+        "description": "Random long secret used for local session hardening. Generate with `openssl rand -base64 32`."
+      }
+    }
+  },
+  "dependencies": {
+    "@hono/inertia": "^0.2.0",
+    "hono": "^4.12.16",
+    "react": "^19.2.5",
+    "react-dom": "^19.2.5"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.5",
+    "wrangler": "^4.87.0"
+  }
+}

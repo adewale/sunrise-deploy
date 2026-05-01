@@ -1,0 +1,12 @@
+# Sunrise first-boot secrets.
+# Cloudflare Deploy uses this file plus package.json cloudflare.bindings descriptions
+# to prompt deploy-button users for required values.
+
+GITHUB_CLIENT_ID=""
+GITHUB_CLIENT_SECRET=""
+OWNER_LOGIN=""
+# Optional: immutable GitHub numeric id.
+OWNER_ID=""
+SESSION_SECRET=""
+# Local-only helper; do not enable in production.
+TEST_GITHUB_FIXTURES="true"

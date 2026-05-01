@@ -1,0 +1,17 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "sunrise",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-05-01",
+  "d1_databases": [
+    { "binding": "DB", "database_name": "sunrise", "database_id": "replace-with-your-d1-id", "migrations_dir": "migrations" }
+  ],
+  "queues": {
+    "producers": [{ "binding": "GITHUB_QUEUE", "queue": "sunrise-github" }],
+    "consumers": [{ "queue": "sunrise-github" }]
+  },
+  "triggers": { "crons": ["0 12 * * *"] },
+  "vars": {
+    "GITHUB_REPO_URL": "https://github.com/your-org/sunrise"
+  }
+}
