@@ -55,7 +55,7 @@ app.get('/callback', async (c) => {
   if (!tokenJson.access_token) return c.text('OAuth token exchange failed', 401);
   const userRes = await fetch('https://api.github.com/user', { headers: { Authorization: `Bearer ${tokenJson.access_token}`, Accept: 'application/vnd.github+json', 'User-Agent': 'sunrise-dashboard' } });
   const user = await userRes.json<any>();
-  if ((c.env.OWNER_LOGIN && user.login !== c.env.OWNER_LOGIN) || (c.env.OWNER_ID && String(user.id) !== String(c.env.OWNER_ID))) return html('<h1>Not owner</h1><p>This is a personal Sunrise instance. Deploy your own version from the GitHub repo.</p>', 403);
+  if (c.env.OWNER_LOGIN && user.login !== c.env.OWNER_LOGIN) return html('<h1>Not owner</h1><p>This is a personal Sunrise instance. Deploy your own version from the GitHub repo.</p>', 403);
   const sid = crypto.randomUUID();
   await c.env.DB.prepare('INSERT INTO sessions (id, github_login, github_id, access_token, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?)')
     .bind(sid, user.login, String(user.id), tokenJson.access_token, new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(), new Date().toISOString()).run();
@@ -208,7 +208,7 @@ function renderSetupGuide(missing: string[], requestUrl: string) {
   const steps = [
     ['Deploy your own copy', 'Use the Deploy to Cloudflare button. Cloudflare forks the repo, provisions D1 and Queues from wrangler.jsonc, runs the build, and enables deploys from your fork.'],
     ['Create a GitHub OAuth app', `Use Homepage URL ${origin} and Authorization callback URL ${callbackUrl}.`],
-    ['Add secrets in Cloudflare', `Open ${dashboardPath}. Set GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET, OWNER_LOGIN, optional OWNER_ID, and SESSION_SECRET.`],
+    ['Add secrets in Cloudflare', `Open ${dashboardPath}. Set GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET, OWNER_LOGIN, and SESSION_SECRET.`],
     ['Reload this page', 'The checklist reads this instance configuration. When required secrets are present, Sign in with GitHub becomes the happy path.'],
     ['Sign in and refresh', 'Sign in as the configured owner, then use Manual refresh to populate the first dashboard snapshot.'],
   ];
