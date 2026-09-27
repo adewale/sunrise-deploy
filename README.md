@@ -1,5 +1,11 @@
 # Sunrise
 
+> [!WARNING]
+> **This fork is frozen.** It is the maintainer's personal instance, pinned at Sunrise 0.1.0 (`b7e6f06`), and gets no further development here. The canonical, maintained code is **[adewale/sunrise](https://github.com/adewale/sunrise)**, which has moved on to 0.2.0: the Vite + Inertia stack, and tests that run against real D1 in workerd plus a browser E2E suite.
+>
+> - Do not treat this repository's tests as evidence for upstream. They still use `test/memory-db.ts`, a regex-dispatched in-memory D1 double that upstream removed because it accepted what real D1 rejects: it matches SQL by regex, ignores parts of `WHERE` clauses and accepts extra bind values.
+> - The fork's history diverged from upstream. A trial `git merge` of upstream `main` (0.2.0) on 2026-09-27 conflicted in 33 files, so upgrading in place means re-applying the fork's deployment config onto upstream, not a clean merge. To bring the instance up to date, follow upstream's [`docs/agent-upgrade-contract.md`](https://github.com/adewale/sunrise/blob/main/docs/agent-upgrade-contract.md). Keep this deployment's `wrangler.jsonc` resource names and IDs, queues, secrets and OAuth settings, and run upstream's `npm run verify` before deploying.
+
 A self-hosted morning dashboard for the GitHub work that needs your attention.
 
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/adewale/sunrise&paid=true)
